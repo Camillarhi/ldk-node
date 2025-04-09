@@ -30,10 +30,10 @@ use lightning::util::persist::KVStore;
 
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 
-use bitcoin::hashes::Hash;
-use bitcoin::Amount;
 use bitcoin::address::NetworkUnchecked;
+use bitcoin::hashes::Hash;
 use bitcoin::Address;
+use bitcoin::Amount;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use log::LevelFilter;
 
@@ -373,10 +373,13 @@ fn onchain_send_receive() {
 	);
 
 	assert_eq!(
-		Err(NodeError::InvalidNetworkAddress {
-			expected: node_a.config().network,
-		}),
+		Err(NodeError::InvalidAddress),
 		node_a.onchain_payment().send_to_address(&addr_c, expected_node_a_balance + 1, None)
+	);
+
+	assert_eq!(
+		Err(NodeError::InvalidAddress),
+		node_a.onchain_payment().send_all_to_address(&addr_c, true, None)
 	);
 
 	let amount_to_send_sats = 54321;
