@@ -121,13 +121,6 @@ pub enum Error {
 	LiquiditySourceUnavailable,
 	/// The given operation failed due to the LSP's required opening fee being too high.
 	LiquidityFeeTooHigh,
-	/// The given address is invalid.
-	InvalidAddressFormat,
-	///Address belongs to the wrong network
-	InvalidNetworkAddress {
-		/// The expected network.
-        expected: Network
-    },
 }
 
 impl fmt::Display for Error {
@@ -201,8 +194,6 @@ impl fmt::Display for Error {
 			Self::LiquidityFeeTooHigh => {
 				write!(f, "The given operation failed due to the LSP's required opening fee being too high.")
 			},
-			Self::InvalidAddressFormat => write!(f, "The given address is invalid."),
-			Self::InvalidNetworkAddress { expected } => write!(f, "The given address is invalid. Expected network: {:?}", expected),
 		}
 	}
 }

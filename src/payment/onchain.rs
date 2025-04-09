@@ -82,7 +82,7 @@ impl OnchainPayment {
 			return Err(Error::NotRunning);
 		}
 
-		let validated_address = self.parse_and_validate_address(self.config.network, &address.to_string())?;
+		let validated_address = self.parse_and_validate_address(self.config.network, &address)?;
 
 		let cur_anchor_reserve_sats =
 			crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
@@ -90,25 +90,6 @@ impl OnchainPayment {
 			OnchainSendAmount::ExactRetainingReserve { amount_sats, cur_anchor_reserve_sats };
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
 		self.wallet.send_to_address(&validated_address, send_amount, fee_rate_opt)
-	}
-
-	/// Validates a Bitcoin address is properly formatted and matches the expected network.
-	///
-	/// Returns `Ok(Address)` if valid, or:
-	/// - `InvalidAddressFormat` if malformed
-	/// - `InvalidNetworkAddress` if valid but wrong network
-	///
-	/// # Example
-	/// ```
-	/// let address = "tb1q..."; // Testnet address
-	/// parse_and_validate_address(Network::Testnet, address)?;
-	pub fn parse_and_validate_address(&self, network: Network, address: &str) -> Result<Address, Error> {
-		Address::<NetworkUnchecked>::from_str(address)
-        .map_err(|_| Error::InvalidAddressFormat)?
-        .require_network(network)
-        .map_err(|_| Error::InvalidNetworkAddress {
-			expected: network,
-		})
 	}
 
 	/// Send an on-chain payment to the given address, draining the available funds.
@@ -134,6 +115,8 @@ impl OnchainPayment {
 			return Err(Error::NotRunning);
 		}
 
+		let validated_address = self.parse_and_validate_address(self.config.network, &address)?;
+
 		let send_amount = if retain_reserves {
 			let cur_anchor_reserve_sats =
 				crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
@@ -143,6 +126,25 @@ impl OnchainPayment {
 		};
 
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
-		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
+		self.wallet.send_to_address(&validated_address, send_amount, fee_rate_opt)
+	}
+
+	/// Validates a Bitcoin address is properly formatted and matches the expected network.
+	///
+	/// Returns `Ok(Address)` if valid, or:
+	/// - `InvalidAddressFormat` if malformed
+	/// - `InvalidNetworkAddress` if valid but wrong network
+	///
+	/// # Example
+	/// ```
+	/// let address = "tb1q..."; // Testnet address
+	/// parse_and_validate_address(Network::Testnet, address)?;
+	pub fn parse_and_validate_address(
+		&self, network: Network, address: &Address,
+	) -> Result<Address, Error> {
+		Address::<NetworkUnchecked>::from_str(address.to_string().as_str())
+			.map_err(|_| Error::InvalidAddress)?
+			.require_network(network)
+			.map_err(|_| Error::InvalidAddress)
 	}
 }
