@@ -10,7 +10,6 @@ use bdk_chain::local_chain::CannotConnectError as BdkChainConnectionError;
 use bdk_chain::tx_graph::CalculateFeeError as BdkChainCalculateFeeError;
 use bdk_wallet::error::CreateTxError as BdkCreateTxError;
 use bdk_wallet::signer::SignerError as BdkSignerError;
-use bitcoin::Network;
 
 use std::fmt;
 
