@@ -132,8 +132,7 @@ impl OnchainPayment {
 	/// Validates a Bitcoin address is properly formatted and matches the expected network.
 	///
 	/// Returns `Ok(Address)` if valid, or:
-	/// - `InvalidAddressFormat` if malformed
-	/// - `InvalidNetworkAddress` if valid but wrong network
+	/// - `InvalidAddress` if malformed or for a different network
 	///
 	/// # Example
 	/// ```
