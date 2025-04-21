@@ -5,8 +5,10 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use bitcoin::address::NetworkUnchecked;
 use persist::KVStoreWalletPersister;
 
+use crate::config::Config;
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator};
@@ -43,11 +45,11 @@ use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey, Signing};
 use bitcoin::{
-	Amount, FeeRate, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, WitnessProgram,
-	WitnessVersion,
+	Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, WitnessProgram, WitnessVersion
 };
 
 use std::ops::Deref;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 pub(crate) enum OnchainSendAmount {
@@ -71,6 +73,7 @@ where
 	broadcaster: B,
 	fee_estimator: E,
 	payment_store: Arc<PaymentStore<Arc<Logger>>>,
+	config: Arc<Config>,
 	logger: L,
 }
 
@@ -83,11 +86,11 @@ where
 	pub(crate) fn new(
 		wallet: bdk_wallet::PersistedWallet<KVStoreWalletPersister>,
 		wallet_persister: KVStoreWalletPersister, broadcaster: B, fee_estimator: E,
-		payment_store: Arc<PaymentStore<Arc<Logger>>>, logger: L,
+		payment_store: Arc<PaymentStore<Arc<Logger>>>, config: Arc<Config>, logger: L,
 	) -> Self {
 		let inner = Mutex::new(wallet);
 		let persister = Mutex::new(wallet_persister);
-		Self { inner, persister, broadcaster, fee_estimator, payment_store, logger }
+		Self { inner, persister, broadcaster, fee_estimator, payment_store, config, logger }
 	}
 
 	pub(crate) fn get_full_scan_request(&self) -> FullScanRequest<KeychainKind> {
@@ -327,10 +330,32 @@ where
 		self.get_balances(total_anchor_channels_reserve_sats).map(|(_, s)| s)
 	}
 
+	/// Validates a Bitcoin address is properly formatted and matches the expected network.
+	///
+	/// Returns `Ok(Address)` if valid, or:
+	/// - `InvalidAddress` if malformed or for a different network
+	///
+	/// # Example
+	/// ```
+	/// let address = "tb1q..."; // Testnet address
+	/// parse_and_validate_address(Network::Testnet, address)?;
+	pub fn parse_and_validate_address(
+		&self, network: Network, address: &Address,
+	) -> Result<Address, Error> {
+		Address::<NetworkUnchecked>::from_str(address.to_string().as_str())
+			.map_err(|_| Error::InvalidAddress)?
+			.require_network(network)
+			.map_err(|_| Error::InvalidAddress)
+	}
+
+	
+
 	pub(crate) fn send_to_address(
 		&self, address: &bitcoin::Address, send_amount: OnchainSendAmount,
 		fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
+		self.parse_and_validate_address(self.config.network, &address)?;
+
 		// Use the set fee_rate or default to fee estimation.
 		let confirmation_target = ConfirmationTarget::OnchainPayment;
 		let fee_rate =
