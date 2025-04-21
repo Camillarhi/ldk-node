@@ -45,7 +45,8 @@ use bitcoin::secp256k1::ecdh::SharedSecret;
 use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, SecretKey, Signing};
 use bitcoin::{
-	Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, WitnessProgram, WitnessVersion
+	Address, Amount, FeeRate, Network, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash,
+	WitnessProgram, WitnessVersion,
 };
 
 use std::ops::Deref;
@@ -347,8 +348,6 @@ where
 			.require_network(network)
 			.map_err(|_| Error::InvalidAddress)
 	}
-
-	
 
 	pub(crate) fn send_to_address(
 		&self, address: &bitcoin::Address, send_amount: OnchainSendAmount,
