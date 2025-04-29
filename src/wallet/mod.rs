@@ -331,16 +331,7 @@ where
 		self.get_balances(total_anchor_channels_reserve_sats).map(|(_, s)| s)
 	}
 
-	/// Validates a Bitcoin address is properly formatted and matches the expected network.
-	///
-	/// Returns `Ok(Address)` if valid, or:
-	/// - `InvalidAddress` if malformed or for a different network
-	///
-	/// # Example
-	/// ```
-	/// let address = "tb1q..."; // Testnet address
-	/// parse_and_validate_address(Network::Testnet, address)?;
-	pub fn parse_and_validate_address(
+	fn parse_and_validate_address(
 		&self, network: Network, address: &Address,
 	) -> Result<Address, Error> {
 		Address::<NetworkUnchecked>::from_str(address.to_string().as_str())
