@@ -94,6 +94,9 @@ pub(crate) const RGS_SYNC_TIMEOUT_SECS: u64 = 5;
 /// The length in bytes of our wallets' keys seed.
 pub const WALLET_KEYS_SEED_LEN: usize = 64;
 
+// The time in-between unconfirmed transaction broadcasts.
+pub(crate) const UNCONFIRMED_TX_BROADCAST_INTERVAL: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone)]
 /// Represents the configuration of an [`Node`] instance.
 ///
@@ -179,6 +182,16 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub sending_parameters: Option<SendingParameters>,
+	/// Policy for controlling transaction rebroadcasting behavior.
+	///
+	/// This policy determines how and when unconfirmed transactions are rebroadcast to the network
+	/// to improve confirmation reliability.
+	///
+	/// ### Default Behavior
+	/// - Minimum interval: 300 seconds (5 minutes)
+	/// - Maximum attempts: 24
+	/// - Exponential backoff factor: 1.5 (50% increase each attempt)
+	pub rebroadcast_policy: RebroadcastPolicy,
 }
 
 impl Default for Config {
@@ -193,6 +206,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			sending_parameters: None,
 			node_alias: None,
+			rebroadcast_policy: RebroadcastPolicy::default(),
 		}
 	}
 }
@@ -531,6 +545,45 @@ impl From<MaxDustHTLCExposure> for LdkMaxDustHTLCExposure {
 				Self::FeeRateMultiplier(multiplier)
 			},
 		}
+	}
+}
+
+/// Policy for controlling transaction rebroadcasting behavior.
+///
+/// Determines the strategy for resending unconfirmed transactions to the network
+/// to ensure they remain in mempools and eventually get confirmed.
+#[derive(Clone, Debug)]
+pub struct RebroadcastPolicy {
+	/// Minimum time between rebroadcast attempts in seconds.
+	///
+	/// This prevents excessive network traffic by ensuring a minimum delay
+	/// between consecutive rebroadcast attempts.
+	///
+	/// **Recommended values**: 60-600 seconds (1-10 minutes)
+	pub min_rebroadcast_interval: u64,
+	/// Maximum number of broadcast attempts before giving up.
+	///
+	/// After reaching this limit, the transaction will no longer be rebroadcast
+	/// automatically. Manual intervention may be required.
+	///
+	/// **Recommended values**: 12-48 attempts
+	pub max_broadcast_attempts: u32,
+	/// Exponential backoff factor for increasing intervals between attempts.
+	///
+	/// Each subsequent rebroadcast wait time is multiplied by this factor,
+	/// creating an exponential backoff pattern.
+	///
+	/// - `1.0`: No backoff (constant interval)
+	/// - `1.5`: 50% increase each attempt
+	/// - `2.0`: 100% increase (doubling) each attempt
+	///
+	/// **Recommended values**: 1.2-2.0
+	pub backoff_factor: f32,
+}
+
+impl Default for RebroadcastPolicy {
+	fn default() -> Self {
+		Self { min_rebroadcast_interval: 300, max_broadcast_attempts: 24, backoff_factor: 1.5 }
 	}
 }
 
