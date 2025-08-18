@@ -120,4 +120,31 @@ impl OnchainPayment {
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
 		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
 	}
+
+	/// Manually trigger a rebroadcast of a specific transaction according to the default policy.
+	///
+	/// This is useful if you suspect a transaction may not have propagated properly through the
+	/// network and you want to attempt to rebroadcast it immediately rather than waiting for the
+	/// automatic background job to handle it.
+	///
+	/// updating the attempt count and last broadcast time for the transaction in the payment store.
+	pub fn rebroadcast_transaction(&self, txid: Txid) -> Result<(), Error> {
+		self.wallet.rebroadcast_transaction(txid)?;
+		Ok(())
+	}
+
+	/// Attempt to bump the fee of an unconfirmed transaction using Replace-by-Fee (RBF).
+	///
+	/// This creates a new transaction that replaces the original one, increasing the fee by the
+	/// specified increment to improve its chances of confirmation. The original transaction must
+	/// be signaling RBF replaceability for this to succeed.
+	///
+	/// `fee_bump_increment` specifies the additional fee amount in satoshis to add to the
+	/// transaction. The new transaction will have the same outputs as the original but with a
+	/// higher fee, resulting in faster confirmation potential.
+	///
+	/// Returns the Txid of the new replacement transaction if successful.
+	pub fn bump_fee_rbf(&self, txid: Txid, fee_bump_increment: u64) -> Result<Txid, Error> {
+		self.wallet.bump_fee_rbf(txid, fee_bump_increment)
+	}
 }

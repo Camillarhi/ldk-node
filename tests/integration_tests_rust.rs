@@ -33,9 +33,9 @@ use lightning::util::persist::KVStore;
 use lightning_invoice::{Bolt11InvoiceDescription, Description};
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
-use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
+use bitcoin::{address::NetworkUnchecked, Txid};
 use bitcoin::{Address, Amount, ScriptBuf};
 use log::LevelFilter;
 
@@ -444,7 +444,7 @@ fn onchain_send_receive() {
 
 	let payment_a = node_a.payment(&payment_id).unwrap();
 	match payment_a.kind {
-		PaymentKind::Onchain { txid: _txid, status } => {
+		PaymentKind::Onchain { txid: _txid, status, .. } => {
 			assert_eq!(_txid, txid);
 			assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
 		},
@@ -453,7 +453,7 @@ fn onchain_send_receive() {
 
 	let payment_b = node_a.payment(&payment_id).unwrap();
 	match payment_b.kind {
-		PaymentKind::Onchain { txid: _txid, status } => {
+		PaymentKind::Onchain { txid: _txid, status, .. } => {
 			assert_eq!(_txid, txid);
 			assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
 		},
@@ -669,6 +669,273 @@ fn onchain_wallet_recovery() {
 		recovered_node.list_balances().spendable_onchain_balance_sats,
 		premine_amount_sat * 3
 	);
+}
+
+#[test]
+fn onchain_fee_bump_rbf() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::Esplora(&electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	// Fund both nodes
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+
+	let premine_amount_sat = 500_000;
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a.clone(), addr_b.clone()],
+		Amount::from_sat(premine_amount_sat),
+	);
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Send a transaction from node_b to node_a that we'll later bump
+	let amount_to_send_sats = 100_000;
+	let txid =
+		node_b.onchain_payment().send_to_address(&addr_a, amount_to_send_sats, None).unwrap();
+	println!("Sent txid: {}", txid);
+	wait_for_tx(&electrsd.client, txid);
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	println!("\n=== DEBUG: All payments in node_b ===");
+	for payment in node_b.list_payments() {
+		println!(
+        "Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+        payment.id,
+        payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	println!("\n=== DEBUG: All payments in node_a ===");
+	for payment in node_a.list_payments() {
+		println!(
+			"Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+			payment.id,
+			payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	let payment_id = PaymentId(txid.to_byte_array());
+	let original_payment = node_b.payment(&payment_id).unwrap();
+	let original_fee = original_payment.fee_paid_msat.unwrap();
+
+	// Zero fee bump
+	assert_eq!(Err(NodeError::InvalidFeeRate), node_b.onchain_payment().bump_fee_rbf(txid, 0));
+
+	// Non-existent transaction
+	let fake_txid =
+		Txid::from_str("0000000000000000000000000000000000000000000000000000000000000000").unwrap();
+	assert_eq!(
+		Err(NodeError::InvalidPaymentId),
+		node_b.onchain_payment().bump_fee_rbf(fake_txid, 10)
+	);
+
+	// Bump an inbound payment
+	assert_eq!(Err(NodeError::InvalidPaymentId), node_a.onchain_payment().bump_fee_rbf(txid, 10));
+
+	// Successful fee bump
+	let new_txid = node_b.onchain_payment().bump_fee_rbf(txid, 10).unwrap();
+	println!("Bumped to new txid: {}", new_txid);
+	wait_for_tx(&electrsd.client, new_txid);
+
+	// Sleep to allow for transaction propagation
+	std::thread::sleep(std::time::Duration::from_secs(5));
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	// Verify old payment is removed and new payment exists
+	assert!(node_b.payment(&payment_id).is_none(), "Old payment should be removed");
+
+	println!("\n=== DEBUG: All payments in node_b after first bump ===");
+	for payment in node_b.list_payments() {
+		println!(
+        "Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+        payment.id,
+        payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	println!("\n=== DEBUG: All payments in node_a after first bump ===");
+	for payment in node_a.list_payments() {
+		println!(
+        "Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+        payment.id,
+        payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	let new_payment_id = PaymentId(new_txid.to_byte_array());
+	let new_payment = node_b.payment(&new_payment_id).unwrap();
+
+	// Verify payment properties
+	assert_eq!(new_payment.amount_msat, Some(amount_to_send_sats * 1000));
+	assert_eq!(new_payment.direction, PaymentDirection::Outbound);
+	assert_eq!(new_payment.status, PaymentStatus::Pending);
+
+	// Verify fee increased
+	assert!(
+		new_payment.fee_paid_msat > Some(original_fee),
+		"Fee should increase after RBF bump. Original: {}, New: {}",
+		original_fee,
+		new_payment.fee_paid_msat.unwrap()
+	);
+
+	// Multiple consecutive bumps
+	let second_bump_txid = node_b.onchain_payment().bump_fee_rbf(new_txid, 5).unwrap();
+	println!("Bumped to new txid: {}", second_bump_txid);
+	wait_for_tx(&electrsd.client, second_bump_txid);
+
+	// Sleep to allow for transaction propagation
+	std::thread::sleep(std::time::Duration::from_secs(5));
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	assert!(node_b.payment(&new_payment_id).is_none(), "First bump payment should be removed");
+
+	println!("\n=== DEBUG: All payments in node_b after second bump ===");
+	for payment in node_b.list_payments() {
+		println!(
+        "Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+        payment.id,
+        payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	println!("\n=== DEBUG: All payments in node_a after second bump ===");
+	for payment in node_a.list_payments() {
+		println!(
+        "Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+        payment.id,
+        payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	let second_payment_id = PaymentId(second_bump_txid.to_byte_array());
+	let second_payment = node_b.payment(&second_payment_id).unwrap();
+
+	assert!(
+		second_payment.fee_paid_msat > new_payment.fee_paid_msat,
+		"Second bump should have higher fee than first bump"
+	);
+
+	// Confirm the transaction and try to bump again (should fail)
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6);
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	assert_eq!(
+		Err(NodeError::InvalidPaymentId),
+		node_b.onchain_payment().bump_fee_rbf(second_bump_txid, 10)
+	);
+
+	println!("\n=== DEBUG: All payments in node_b ===");
+	for payment in node_b.list_payments() {
+		println!(
+        "Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+        payment.id,
+        payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	println!("\n=== DEBUG: All payments in node_a ===");
+	for payment in node_a.list_payments() {
+		println!(
+			"Payment ID: {:?}, Status: {:?}, Fee paid: {:?} msat, Direction: {:?}, Amount: {:?} msat",
+			payment.id,
+			payment.status,
+        payment.fee_paid_msat,
+        payment.direction,
+        payment.amount_msat
+    );
+		if let PaymentKind::Onchain { txid, status, .. } = &payment.kind {
+			println!("  TXID: {}, Confirmation Status: {:?}", txid, status);
+		}
+		println!("---");
+	}
+	println!("=== END DEBUG ===\n");
+
+	// Verify final payment is confirmed
+	let final_payment = node_b.payment(&second_payment_id).unwrap();
+	assert_eq!(final_payment.status, PaymentStatus::Succeeded);
+	match final_payment.kind {
+		PaymentKind::Onchain { status, .. } => {
+			assert!(matches!(status, ConfirmationStatus::Confirmed { .. }));
+		},
+		_ => panic!("Unexpected payment kind"),
+	}
+
+	// Verify node A received the funds correctly
+	let node_a_received_payment = node_a.list_payments_with_filter(
+		|p| matches!(p.kind, PaymentKind::Onchain { txid, .. } if txid == second_bump_txid),
+	);
+	assert_eq!(node_a_received_payment.len(), 1);
+	assert_eq!(node_a_received_payment[0].amount_msat, Some(amount_to_send_sats * 1000));
+	assert_eq!(node_a_received_payment[0].status, PaymentStatus::Succeeded);
+
+	println!("RBF fee bump test completed successfully!");
 }
 
 #[test]

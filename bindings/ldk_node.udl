@@ -13,11 +13,18 @@ dictionary Config {
 	u64 probing_liquidity_limit_multiplier;
 	AnchorChannelsConfig? anchor_channels_config;
 	SendingParameters? sending_parameters;
+	RebroadcastPolicy rebroadcast_policy;
 };
 
 dictionary AnchorChannelsConfig {
 	sequence<PublicKey> trusted_peers_no_reserve;
 	u64 per_channel_reserve_sats;
+};
+
+dictionary RebroadcastPolicy {
+	u64 min_rebroadcast_interval;
+	u32 max_broadcast_attempts;
+	f32 backoff_factor;
 };
 
 dictionary BackgroundSyncConfig {
@@ -231,6 +238,10 @@ interface OnchainPayment {
 	Txid send_to_address([ByRef]Address address, u64 amount_sats, FeeRate? fee_rate);
 	[Throws=NodeError]
 	Txid send_all_to_address([ByRef]Address address, boolean retain_reserve, FeeRate? fee_rate);
+	[Throws=NodeError]
+	void rebroadcast_transaction(Txid txid);
+	[Throws=NodeError]
+	Txid bump_fee_rbf(Txid txid, u64 fee_bump_increment);
 };
 
 interface FeeRate {
@@ -409,7 +420,7 @@ interface ClosureReason {
 
 [Enum]
 interface PaymentKind {
-	Onchain(Txid txid, ConfirmationStatus status);
+	Onchain(Txid txid, ConfirmationStatus status, sequence<u8>? raw_tx, u64? last_broadcast_time, u32 broadcast_attempts);
 	Bolt11(PaymentHash hash, PaymentPreimage? preimage, PaymentSecret? secret);
 	Bolt11Jit(PaymentHash hash, PaymentPreimage? preimage, PaymentSecret? secret, u64? counterparty_skimmed_fee_msat, LSPFeeLimits lsp_fee_limits);
 	Bolt12Offer(PaymentHash? hash, PaymentPreimage? preimage, PaymentSecret? secret, OfferId offer_id, UntrustedString? payer_note, u64? quantity);
