@@ -29,6 +29,7 @@ use bitcoin::{
 	Address, Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut, Txid, WPubkeyHash, Weight,
 	WitnessProgram, WitnessVersion,
 };
+
 use lightning::chain::chaininterface::BroadcasterInterface;
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::{BestBlock, Listen};
@@ -46,7 +47,7 @@ use lightning::util::message_signing;
 use lightning_invoice::RawBolt11Invoice;
 use persist::KVStoreWalletPersister;
 
-use crate::config::Config;
+use crate::config::{Config, RebroadcastPolicy};
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::payment::store::ConfirmationStatus;
@@ -56,6 +57,7 @@ use crate::payment::{
 use crate::types::{Broadcaster, PaymentStore, PendingPaymentStore};
 use crate::Error;
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub(crate) enum OnchainSendAmount {
 	ExactRetainingReserve { amount_sats: u64, cur_anchor_reserve_sats: u64 },
 	AllRetainingReserve { cur_anchor_reserve_sats: u64 },
@@ -237,8 +239,13 @@ impl Wallet {
 						confirmation_status,
 					);
 
-					let pending_payment =
-						self.create_pending_payment_from_tx(payment.clone(), Vec::new());
+					let pending_payment = self.create_pending_payment_from_tx(
+						payment.clone(),
+						Vec::new(),
+						Some(&tx),
+						None,
+						None,
+					);
 
 					self.payment_store.insert_or_update(payment)?;
 					self.pending_payment_store.insert_or_update(pending_payment)?;
@@ -285,8 +292,13 @@ impl Wallet {
 						PaymentStatus::Pending,
 						ConfirmationStatus::Unconfirmed,
 					);
-					let pending_payment =
-						self.create_pending_payment_from_tx(payment.clone(), Vec::new());
+					let pending_payment = self.create_pending_payment_from_tx(
+						payment.clone(),
+						Vec::new(),
+						Some(&tx),
+						None,
+						None,
+					);
 					self.payment_store.insert_or_update(payment)?;
 					self.pending_payment_store.insert_or_update(pending_payment)?;
 				},
@@ -307,9 +319,15 @@ impl Wallet {
 						PaymentStatus::Pending,
 						ConfirmationStatus::Unconfirmed,
 					);
-					let pending_payment_details = self
-						.create_pending_payment_from_tx(payment.clone(), conflict_txids.clone());
+					let pending_payment_details = self.create_pending_payment_from_tx(
+						payment.clone(),
+						conflict_txids.clone(),
+						None,
+						None,
+						None,
+					);
 
+					self.payment_store.insert_or_update(payment)?;
 					self.pending_payment_store.insert_or_update(pending_payment_details)?;
 				},
 				WalletEvent::TxDropped { txid, tx } => {
@@ -324,8 +342,13 @@ impl Wallet {
 						PaymentStatus::Pending,
 						ConfirmationStatus::Unconfirmed,
 					);
-					let pending_payment =
-						self.create_pending_payment_from_tx(payment.clone(), Vec::new());
+					let pending_payment = self.create_pending_payment_from_tx(
+						payment.clone(),
+						Vec::new(),
+						Some(&tx),
+						None,
+						None,
+					);
 					self.payment_store.insert_or_update(payment)?;
 					self.pending_payment_store.insert_or_update(pending_payment)?;
 				},
@@ -957,9 +980,16 @@ impl Wallet {
 	}
 
 	fn create_pending_payment_from_tx(
-		&self, payment: PaymentDetails, conflicting_txids: Vec<Txid>,
+		&self, payment: PaymentDetails, conflicting_txids: Vec<Txid>, tx: Option<&Transaction>,
+		last_broadcast_time: Option<u64>, broadcast_attempts: Option<u32>,
 	) -> PendingPaymentDetails {
-		PendingPaymentDetails::new(payment, conflicting_txids)
+		PendingPaymentDetails::new(
+			payment,
+			conflicting_txids,
+			tx.cloned(),
+			last_broadcast_time,
+			broadcast_attempts,
+		)
 	}
 
 	fn find_payment_by_txid(&self, target_txid: Txid) -> Option<PaymentId> {
@@ -977,6 +1007,114 @@ impl Wallet {
 		}
 
 		None
+	}
+
+	pub(crate) fn rebroadcast_unconfirmed_transactions(&self) -> Result<(), Error> {
+		let policy = RebroadcastPolicy::default();
+		let unconfirmed_payments = self.pending_payment_store.list_filter(|p| {
+			matches!(
+				p.details.kind,
+				PaymentKind::Onchain { status: ConfirmationStatus::Unconfirmed, .. }
+			) && matches!(p.details.direction, PaymentDirection::Outbound)
+		});
+
+		log_debug!(self.logger, "Found {} unconfirmed transactions", unconfirmed_payments.len());
+
+		if unconfirmed_payments.is_empty() {
+			log_info!(self.logger, "No unconfirmed transactions to rebroadcast");
+			return Ok(());
+		}
+
+		let mut rebroadcast_count = 0;
+
+		for mut pending_payment in unconfirmed_payments {
+			let now = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap_or(Duration::from_secs(0))
+				.as_secs();
+
+			let Some(ref raw_tx) = pending_payment.raw_tx else {
+				log_info!(
+					self.logger,
+					"No raw transaction data for {}",
+					pending_payment.details.id
+				);
+				continue;
+			};
+
+			let should_rebroadcast = match pending_payment.last_broadcast_time {
+				Some(last_time) => {
+					let next_allowed_time = last_time
+						+ self.calculate_backoff_interval(
+							(pending_payment.broadcast_attempts).unwrap_or(0),
+							&policy,
+						);
+					now >= next_allowed_time
+						&& (pending_payment.broadcast_attempts).unwrap_or(0)
+							< policy.max_broadcast_attempts
+				},
+				None => true,
+			};
+
+			if !should_rebroadcast {
+				continue;
+			}
+
+			pending_payment.last_broadcast_time = Some(now);
+			pending_payment.broadcast_attempts =
+				Some(pending_payment.broadcast_attempts.unwrap_or(0) + 1);
+
+			self.broadcaster.broadcast_transactions(&[&raw_tx]);
+			rebroadcast_count += 1;
+
+			log_info!(
+				self.logger,
+				"Rebroadcast unconfirmed transaction {}",
+				pending_payment.details.id
+			);
+
+			self.pending_payment_store.insert_or_update(pending_payment)?;
+		}
+
+		if rebroadcast_count > 0 {
+			log_info!(self.logger, "Successfully rebroadcast {} transactions", rebroadcast_count);
+		}
+
+		Ok(())
+	}
+
+	fn calculate_backoff_interval(&self, attempt: u32, policy: &RebroadcastPolicy) -> u64 {
+		let base_interval = policy.min_rebroadcast_interval_secs as f32;
+		let interval = base_interval * policy.backoff_factor.powi(attempt as i32);
+		interval.round() as u64
+	}
+
+	pub(crate) fn rebroadcast_transaction(&self, payment_id: PaymentId) -> Result<(), Error> {
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or(Duration::from_secs(0))
+			.as_secs();
+
+		if let Some(mut pending_payment) = self.pending_payment_store.get(&payment_id) {
+			if let Some(ref raw_tx) = pending_payment.raw_tx {
+				pending_payment.last_broadcast_time = Some(now);
+				pending_payment.broadcast_attempts =
+					Some(pending_payment.broadcast_attempts.unwrap_or(0) + 1);
+
+				self.broadcaster.broadcast_transactions(&[&raw_tx]);
+				log_info!(self.logger, "Rebroadcast transaction {}", payment_id);
+
+				self.pending_payment_store.insert_or_update(pending_payment)?;
+
+				return Ok(());
+			} else {
+				log_info!(self.logger, "No details found for payment {} in store", payment_id);
+				return Err(Error::InvalidPaymentId);
+			}
+		}
+
+		log_info!(self.logger, "No details found for payment {} in store", payment_id);
+		return Err(Error::InvalidPaymentId);
 	}
 }
 

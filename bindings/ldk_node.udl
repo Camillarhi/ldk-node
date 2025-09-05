@@ -13,6 +13,7 @@ dictionary Config {
 	u64 probing_liquidity_limit_multiplier;
 	AnchorChannelsConfig? anchor_channels_config;
 	RouteParametersConfig? route_parameters;
+	boolean auto_rebroadcast_unconfirmed_tx;
 };
 
 dictionary AnchorChannelsConfig {
@@ -266,6 +267,10 @@ interface OnchainPayment {
 	Txid send_to_address([ByRef]Address address, u64 amount_sats, FeeRate? fee_rate);
 	[Throws=NodeError]
 	Txid send_all_to_address([ByRef]Address address, boolean retain_reserve, FeeRate? fee_rate);
+	[Throws=NodeError]
+	void rebroadcast_transaction(PaymentId payment_id);
+	[Throws=NodeError]
+	Txid bump_fee_rbf(PaymentId payment_id);
 };
 
 interface FeeRate {
@@ -351,6 +356,7 @@ enum NodeError {
 	"InvalidBlindedPaths",
 	"AsyncPaymentServicesDisabled",
 	"HrnParsingFailed",
+	"InvalidTransaction",
 };
 
 dictionary NodeStatus {
