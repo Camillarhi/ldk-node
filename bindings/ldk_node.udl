@@ -351,6 +351,9 @@ enum NodeError {
 	"InvalidBlindedPaths",
 	"AsyncPaymentServicesDisabled",
 	"HrnParsingFailed",
+	"LiquiditySetWebhookFailed",
+	"LiquidityRemoveWebhookFailed",
+	"LiquidityListWebhooksFailed"
 };
 
 dictionary NodeStatus {
