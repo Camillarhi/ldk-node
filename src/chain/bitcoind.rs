@@ -638,6 +638,89 @@ impl BitcoindChainSource {
 			}
 		}
 	}
+
+	pub(crate) async fn can_broadcast_transaction(&self, tx: &Transaction) -> Result<bool, Error> {
+		let timeout_fut = tokio::time::timeout(
+			Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
+			self.api_client.test_mempool_accept(tx),
+		);
+
+		match timeout_fut.await {
+			Ok(res) => res.map_err(|e| {
+				log_error!(
+					self.logger,
+					"Failed to test mempool accept for transaction {}: {}",
+					tx.compute_txid(),
+					e
+				);
+				Error::TxBroadcastFailed
+			}),
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to test mempool accept for transaction {} due to timeout: {}",
+					tx.compute_txid(),
+					e
+				);
+				log_trace!(
+					self.logger,
+					"Failed test mempool accept transaction bytes: {}",
+					log_bytes!(tx.encode())
+				);
+				Err(Error::TxBroadcastFailed)
+			},
+		}
+	}
+
+	pub(crate) async fn get_transaction(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
+		let timeout_fut = tokio::time::timeout(
+			Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
+			self.api_client.get_raw_transaction(txid),
+		);
+
+		match timeout_fut.await {
+			Ok(res) => res.map_err(|e| {
+				log_error!(self.logger, "Failed to get transaction {}: {}", txid, e);
+				Error::TxSyncFailed
+			}),
+			Err(e) => {
+				log_error!(self.logger, "Failed to get transaction {} due to timeout: {}", txid, e);
+				Err(Error::TxSyncTimeout)
+			},
+		}
+	}
+
+	pub(crate) async fn is_outpoint_spent(&self, outpoint: &OutPoint) -> Result<bool, Error> {
+		let timeout_fut = tokio::time::timeout(
+			Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
+			self.api_client.get_tx_out(outpoint),
+		);
+
+		match timeout_fut.await {
+			Ok(res) => {
+				// get_tx_out returns true if output exists (unspent), false if spent
+				// We want to return true if spent, so invert the result
+				res.map(|exists| !exists).map_err(|e| {
+					log_error!(
+						self.logger,
+						"Failed to check if outpoint {} is spent: {}",
+						outpoint,
+						e
+					);
+					Error::TxSyncFailed
+				})
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to check if outpoint {} is spent due to timeout: {}",
+					outpoint,
+					e
+				);
+				Err(Error::TxSyncTimeout)
+			},
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -1254,6 +1337,142 @@ impl BitcoindClient {
 			.map(|txid| (txid, latest_mempool_timestamp))
 			.collect();
 		Ok(evicted_txids)
+	}
+
+	/// Tests whether the provided transaction would be accepted by the mempool.
+	pub(crate) async fn test_mempool_accept(&self, tx: &Transaction) -> std::io::Result<bool> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => {
+				Self::test_mempool_accept_inner(Arc::clone(rpc_client), tx).await
+			},
+			BitcoindClient::Rest { rpc_client, .. } => {
+				// We rely on the internal RPC client to make this call, as this
+				// operation is not supported by Bitcoin Core's REST interface.
+				Self::test_mempool_accept_inner(Arc::clone(rpc_client), tx).await
+			},
+		}
+	}
+
+	async fn test_mempool_accept_inner(
+		rpc_client: Arc<RpcClient>, tx: &Transaction,
+	) -> std::io::Result<bool> {
+		let tx_serialized = bitcoin::consensus::encode::serialize_hex(tx);
+		let tx_array = serde_json::json!([tx_serialized]);
+
+		let resp =
+			rpc_client.call_method::<serde_json::Value>("testmempoolaccept", &[tx_array]).await?;
+
+		if let Some(array) = resp.as_array() {
+			if let Some(first_result) = array.first() {
+				Ok(first_result.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false))
+			} else {
+				Err(std::io::Error::new(
+					std::io::ErrorKind::Other,
+					"Empty array response from testmempoolaccept",
+				))
+			}
+		} else {
+			Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"testmempoolaccept did not return an array",
+			))
+		}
+	}
+
+	/// Checks if a transaction output is unspent. Returns `true` if the output exists and is
+	/// unspent, `false` otherwise.
+	pub(crate) async fn get_tx_out(&self, outpoint: &OutPoint) -> std::io::Result<bool> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => {
+				Self::get_tx_out_rpc(Arc::clone(rpc_client), outpoint).await
+			},
+			BitcoindClient::Rest { rest_client, .. } => {
+				Self::get_tx_out_rest(Arc::clone(rest_client), outpoint).await
+			},
+		}
+	}
+
+	/// Check if output is unspent via RPC interface.
+	async fn get_tx_out_rpc(
+		rpc_client: Arc<RpcClient>, outpoint: &OutPoint,
+	) -> std::io::Result<bool> {
+		let txid_hex = outpoint.txid.to_string();
+		let txid_json = serde_json::json!(txid_hex);
+		let vout_json = serde_json::json!(outpoint.vout);
+		// include_mempool = true to also check mempool for unspent outputs
+		let include_mempool_json = serde_json::json!(true);
+
+		match rpc_client
+			.call_method::<serde_json::Value>(
+				"gettxout",
+				&[txid_json, vout_json, include_mempool_json],
+			)
+			.await
+		{
+			Ok(resp) => {
+				// If response is null, the output is spent or doesn't exist
+				Ok(!resp.is_null())
+			},
+			Err(e) => Err(std::io::Error::new(
+				std::io::ErrorKind::Other,
+				format!("Failed to check tx output: {}", e),
+			)),
+		}
+	}
+
+	/// Check if output is unspent via REST interface.
+	async fn get_tx_out_rest(
+		rest_client: Arc<RestClient>, outpoint: &OutPoint,
+	) -> std::io::Result<bool> {
+		let txid_hex = outpoint.txid.to_string();
+		// REST endpoint: /rest/getutxos/<checkmempool>/<txid>-<n>.json
+		let utxo_path = format!("getutxos/checkmempool/{}-{}.json", txid_hex, outpoint.vout);
+
+		match rest_client.request_resource::<JsonResponse, serde_json::Value>(&utxo_path).await {
+			Ok(resp) => {
+				// Check if the utxos array has entries
+				if let Some(utxos) = resp.get("utxos") {
+					if let Some(arr) = utxos.as_array() {
+						return Ok(!arr.is_empty());
+					}
+				}
+				Ok(false)
+			},
+			Err(e) => match e.kind() {
+				std::io::ErrorKind::Other => {
+					match e.into_inner() {
+						Some(inner) => {
+							let http_error_res: Result<Box<HttpError>, _> = inner.downcast();
+							match http_error_res {
+								Ok(http_error) => {
+									// 404 means UTXO not found = spent
+									if &http_error.status_code == "404" {
+										Ok(false)
+									} else {
+										Err(std::io::Error::new(
+											std::io::ErrorKind::Other,
+											http_error,
+										))
+									}
+								},
+								Err(_) => Err(std::io::Error::new(
+									std::io::ErrorKind::Other,
+									"Failed to process getutxos response",
+								)),
+							}
+						},
+						None => Err(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							"Failed to process getutxos response",
+						)),
+					}
+				},
+				_ => Err(std::io::Error::new(
+					std::io::ErrorKind::Other,
+					"Failed to process getutxos response",
+				)),
+			},
+		}
 	}
 }
 

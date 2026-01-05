@@ -18,6 +18,7 @@ use lightning::routing::router::RouteParametersConfig;
 use lightning::util::config::{
 	ChannelConfig as LdkChannelConfig, MaxDustHTLCExposure as LdkMaxDustHTLCExposure, UserConfig,
 };
+use reqwest::Url;
 
 use crate::logger::LogLevel;
 
@@ -119,7 +120,8 @@ pub(crate) const EXTERNAL_PATHFINDING_SCORES_SYNC_TIMEOUT_SECS: u64 = 5;
 /// | `probing_liquidity_limit_multiplier`   | 3                  |
 /// | `log_level`                            | Debug              |
 /// | `anchor_channels_config`               | Some(..)           |
-/// | `route_parameters`                   | None               |
+/// | `route_parameters`                     | None               |
+/// | `payjoin_config`                     | None               |
 ///
 /// See [`AnchorChannelsConfig`] and [`RouteParametersConfig`] for more information regarding their
 /// respective default values.
@@ -184,6 +186,7 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub route_parameters: Option<RouteParametersConfig>,
+	pub payjoin_config: Option<PayjoinConfig>,
 }
 
 impl Default for Config {
@@ -198,6 +201,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			route_parameters: None,
 			node_alias: None,
+			payjoin_config: None,
 		}
 	}
 }
@@ -551,6 +555,12 @@ pub enum AsyncPaymentsRole {
 	/// Node acts as a server in an async payments context. This means that it will hold async payments HTLCs and onion
 	/// messages for its peers.
 	Server,
+}
+
+#[derive(Debug, Clone)]
+pub struct PayjoinConfig {
+	pub payjoin_directory: Url,
+	pub ohttp_relay: Url,
 }
 
 #[cfg(test)]

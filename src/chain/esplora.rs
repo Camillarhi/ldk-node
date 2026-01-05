@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_esplora::EsploraAsyncExt;
-use bitcoin::{FeeRate, Network, Script, Transaction, Txid};
+use bitcoin::{FeeRate, Network, OutPoint, Script, Transaction, Txid};
 use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::chain::{Confirm, Filter, WatchedOutput};
 use lightning::util::ser::Writeable;
@@ -432,6 +432,24 @@ impl EsploraChainSource {
 				},
 			}
 		}
+	}
+
+	pub(crate) async fn get_transaction(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
+		self.esplora_client.get_tx(txid).await.map_err(|e| {
+			log_error!(self.logger, "Failed to get transaction {}: {}", txid, e);
+			Error::TxSyncFailed
+		})
+	}
+
+	pub(crate) async fn is_outpoint_spent(&self, outpoint: &OutPoint) -> Result<bool, Error> {
+		self.esplora_client
+			.get_output_status(&outpoint.txid, outpoint.vout as u64)
+			.await
+			.map(|status| status.map_or(false, |s| s.spent))
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to check if outpoint {} is spent: {}", outpoint, e);
+				Error::TxSyncFailed
+			})
 	}
 }
 

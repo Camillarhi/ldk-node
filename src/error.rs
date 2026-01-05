@@ -129,6 +129,8 @@ pub enum Error {
 	InvalidBlindedPaths,
 	/// Asynchronous payment services are disabled.
 	AsyncPaymentServicesDisabled,
+	/// A transaction broadcast operation failed.
+	TxBroadcastFailed,
 }
 
 impl fmt::Display for Error {
@@ -208,6 +210,7 @@ impl fmt::Display for Error {
 			Self::AsyncPaymentServicesDisabled => {
 				write!(f, "Asynchronous payment services are disabled.")
 			},
+			Self::TxBroadcastFailed => write!(f, "Failed to broadcast transaction."),
 		}
 	}
 }
