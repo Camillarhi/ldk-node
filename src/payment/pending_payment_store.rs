@@ -86,7 +86,10 @@ impl StorableObject for PendingPaymentDetails {
 		}
 
 		if let Some(new_conflicting_txids) = &update.conflicting_txids {
-			update_if_necessary!(self.conflicting_txids, new_conflicting_txids.clone());
+			// Don't overwrite existing conflicts with an empty list
+			if !new_conflicting_txids.is_empty() {
+				update_if_necessary!(self.conflicting_txids, new_conflicting_txids.clone());
+			}
 		}
 
 		if let Some(new_raw_tx) = &update.raw_tx {
