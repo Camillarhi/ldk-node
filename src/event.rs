@@ -581,7 +581,7 @@ where
 					Ok(final_tx) => {
 						let needs_manual_broadcast =
 							self.liquidity_source.as_ref().map_or(false, |ls| {
-								ls.as_ref().lsps2_channel_needs_manual_broadcast(
+								ls.as_ref().lsps2_service().lsps2_channel_needs_manual_broadcast(
 									counterparty_node_id,
 									user_channel_id,
 								)
@@ -589,7 +589,7 @@ where
 
 						let result = if needs_manual_broadcast {
 							self.liquidity_source.as_ref().map(|ls| {
-								ls.lsps2_store_funding_transaction(
+								ls.lsps2_service().lsps2_store_funding_transaction(
 									user_channel_id,
 									counterparty_node_id,
 									final_tx.clone(),
@@ -653,7 +653,8 @@ where
 			},
 			LdkEvent::FundingTxBroadcastSafe { user_channel_id, counterparty_node_id, .. } => {
 				self.liquidity_source.as_ref().map(|ls| {
-					ls.lsps2_funding_tx_broadcast_safe(user_channel_id, counterparty_node_id);
+					ls.lsps2_service()
+						.lsps2_funding_tx_broadcast_safe(user_channel_id, counterparty_node_id);
 				});
 			},
 			LdkEvent::PaymentClaimable {
@@ -1162,7 +1163,10 @@ where
 			LdkEvent::ProbeFailed { .. } => {},
 			LdkEvent::HTLCHandlingFailed { failure_type, .. } => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
-					liquidity_source.handle_htlc_handling_failed(failure_type).await;
+					liquidity_source
+						.lsps2_service()
+						.handle_htlc_handling_failed(failure_type)
+						.await;
 				}
 			},
 			LdkEvent::SpendableOutputs { outputs, channel_id, counterparty_node_id } => {
@@ -1263,14 +1267,15 @@ where
 						.try_into()
 						.expect("slice is exactly 16 bytes"),
 				);
-				let allow_0conf = self.config.trusted_peers_0conf.contains(&counterparty_node_id);
-				let mut channel_override_config = None;
-				if let Some((lsp_node_id, _)) = self
+				let is_lsp_node = self
 					.liquidity_source
 					.as_ref()
-					.and_then(|ls| ls.as_ref().get_lsps2_lsp_details())
-				{
-					if lsp_node_id == counterparty_node_id {
+					.map_or(false, |ls| ls.as_ref().is_lsps_node(&counterparty_node_id));
+				let allow_0conf =
+					self.config.trusted_peers_0conf.contains(&counterparty_node_id) || is_lsp_node;
+				let mut channel_override_config = None;
+				if let Some(ls) = self.liquidity_source.as_ref() {
+					if ls.as_ref().is_lsps_node(&counterparty_node_id) {
 						// When we're an LSPS2 client, allow claiming underpaying HTLCs as the LSP will skim off some fee. We'll
 						// check that they don't take too much before claiming.
 						//
@@ -1416,6 +1421,7 @@ where
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					let skimmed_fee_msat = skimmed_fee_msat.unwrap_or(0);
 					liquidity_source
+						.lsps2_service()
 						.handle_payment_forwarded(Some(next_htlc.channel_id), skimmed_fee_msat)
 						.await;
 				}
@@ -1529,6 +1535,7 @@ where
 
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source
+						.lsps2_service()
 						.handle_channel_ready(user_channel_id, &channel_id, &counterparty_node_id)
 						.await;
 				}
@@ -1600,6 +1607,7 @@ where
 			} => {
 				if let Some(liquidity_source) = self.liquidity_source.as_ref() {
 					liquidity_source
+						.lsps2_service()
 						.handle_htlc_intercepted(
 							requested_next_hop_scid,
 							intercept_id,
