@@ -150,16 +150,21 @@ use lightning::impl_writeable_tlv_based;
 use lightning::ln::chan_utils::FUNDING_TRANSACTION_WITNESS_WEIGHT;
 use lightning::ln::channel_state::ChannelDetails as LdkChannelDetails;
 pub use lightning::ln::channel_state::ChannelShutdownState;
-use lightning::ln::channelmanager::PaymentId;
+use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::ln::msgs::SocketAddress;
+use lightning::ln::outbound_payment::{RecipientOnionFields, Retry, RetryableSendFailure};
 use lightning::routing::gossip::NodeAlias;
+use lightning::routing::router::Router as LdkRouter;
+use lightning::routing::router::{PaymentParameters, RouteParameters};
 use lightning::sign::EntropySource;
 use lightning::util::persist::KVStoreSync;
 use lightning::util::wallet_utils::{Input, Wallet as LdkWallet};
 use lightning_background_processor::process_events_async;
 pub use lightning_invoice;
+use lightning_invoice::{PaymentHash, PaymentSecret};
 pub use lightning_liquidity;
 pub use lightning_types;
+use lightning_types::payment::PaymentPreimage;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
 use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
@@ -180,6 +185,8 @@ use types::{
 pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, SyncAndAsyncKVStore, UserChannelId};
 pub use vss_client;
 
+use crate::config::LDK_PAYMENT_RETRY_TIMEOUT;
+use crate::payment::{PaymentDirection, PaymentKind, PaymentStatus};
 use crate::scoring::setup_background_pathfinding_scores_sync;
 use crate::wallet::FundingAmount;
 
@@ -229,7 +236,7 @@ pub struct Node {
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
-	_router: Arc<Router>,
+	router: Arc<Router>,
 	scorer: Arc<Mutex<Scorer>>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
@@ -2056,6 +2063,194 @@ impl Node {
 			);
 			Error::PersistenceFailed
 		})
+	}
+
+	/// Re-dispatches outbound Lightning payments that were left in `Pending` state
+	/// from a previous run. Called once during `start()`.
+	///
+	/// Per LDK's `ChannelManager::list_recent_payments` guidance, we only retry
+	/// payments that ChannelManager is no longer tracking (i.e. all HTLCs for them
+	/// have resolved), which makes retry safe against double-pay.
+	fn retry_pending_payments(&self) {
+		let active_payment_ids: std::collections::HashSet<PaymentId> = self
+			.channel_manager
+			.list_recent_payments()
+			.into_iter()
+			.filter_map(|p| match p {
+				RecentPaymentDetails::Pending { payment_id, .. }
+				| RecentPaymentDetails::AwaitingInvoice { payment_id }
+				| RecentPaymentDetails::Fulfilled { payment_id, .. } => Some(payment_id),
+				RecentPaymentDetails::Abandoned { .. } => None,
+			})
+			.collect();
+
+		let pending_payments: Vec<PaymentDetails> = self.payment_store.list_filter(|p| {
+			p.direction == PaymentDirection::Outbound
+				&& p.status == PaymentStatus::Pending
+				&& matches!(
+					p.kind,
+					PaymentKind::Bolt11 { .. }
+						| PaymentKind::Bolt12Offer { .. }
+						| PaymentKind::Spontaneous { .. }
+				)
+		});
+
+		if pending_payments.is_empty() {
+			return;
+		}
+
+		log_info!(
+			self.logger,
+			"Retrying {} pending outbound Lightning payment(s) from previous run.",
+			pending_payments.len()
+		);
+
+		for payment in pending_payments {
+			if active_payment_ids.contains(&payment.id) {
+				log_debug!(
+					self.logger,
+					"Skipping retry for payment {}: ChannelManager is still tracking it.",
+					payment.id
+				);
+				continue;
+			}
+
+			let amount_msat = match payment.amount_msat {
+				Some(amt) => amt,
+				None => {
+					log_error!(
+						self.logger,
+						"Skipping retry for payment {}: missing amount_msat.",
+						payment.id
+					);
+					continue;
+				},
+			};
+
+			let result = match &payment.kind {
+				&PaymentKind::Bolt11 {
+					hash,
+					secret: Some(secret),
+					counterparty_node_id: Some(node_id),
+					..
+				} => self.retry_invoice_payment(payment.id, hash, secret, node_id, amount_msat),
+				PaymentKind::Spontaneous {
+					preimage: Some(preimage),
+					counterparty_node_id: Some(node_id),
+					..
+				} => self.retry_spontaneous_payment(payment.id, *preimage, *node_id, amount_msat),
+				PaymentKind::Bolt12Offer { .. } => {
+					// TODO: Bolt12 retry requires replaying the offer flow
+					// (fresh invoice_request → new Bolt12Invoice), which needs
+					// offer bytes and flow state we don't currently persist.
+					log_debug!(
+						self.logger,
+						"Skipping retry for Bolt12Offer payment {}: not yet implemented.",
+						payment.id
+					);
+					continue;
+				},
+				_ => {
+					log_debug!(
+						self.logger,
+						"Skipping retry for payment {}: missing data required to retry.",
+						payment.id
+					);
+					continue;
+				},
+			};
+
+			match result {
+				Ok(()) => log_info!(self.logger, "Re-dispatched pending payment {}.", payment.id),
+				Err(e) => {
+					log_error!(
+						self.logger,
+						"Failed to retry pending payment {}: {:?}",
+						payment.id,
+						e
+					);
+				},
+			}
+		}
+	}
+
+	fn build_retry_route_params(&self, node_id: PublicKey, amount_msat: u64) -> RouteParameters {
+		let mut route_params = RouteParameters::from_payment_params_and_value(
+			PaymentParameters::from_node_id(node_id, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA),
+			amount_msat,
+		);
+
+		if let Some(cfg) = self.config.route_parameters.as_ref() {
+			route_params.max_total_routing_fee_msat = cfg.max_total_routing_fee_msat;
+			route_params.payment_params.max_total_cltv_expiry_delta =
+				cfg.max_total_cltv_expiry_delta;
+			route_params.payment_params.max_path_count = cfg.max_path_count;
+			route_params.payment_params.max_channel_saturation_power_of_half =
+				cfg.max_channel_saturation_power_of_half;
+		}
+
+		route_params
+	}
+
+	fn retry_invoice_payment(
+		&self, payment_id: PaymentId, payment_hash: PaymentHash, payment_secret: PaymentSecret,
+		node_id: PublicKey, amount_msat: u64,
+	) -> Result<(), Error> {
+		let route_params = self.build_retry_route_params(node_id, amount_msat);
+
+		let usable_channels = self.channel_manager.list_usable_channels();
+		let first_hops :Vec<_>= usable_channels.iter().collect();
+		let inflight_htlcs = self.channel_manager.compute_inflight_htlcs();
+
+		let route = self
+			.router
+			.find_route(
+				&self.channel_manager.get_our_node_id(),
+				&route_params,
+				Some(&first_hops),
+				inflight_htlcs,
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to find route for retry: {:?}", e);
+				Error::PaymentSendingFailed
+			})?;
+
+		let recipient_fields = RecipientOnionFields::secret_only(payment_secret, amount_msat);
+
+		self.channel_manager
+			.send_payment_with_route(route, payment_hash, recipient_fields, payment_id)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to dispatch retry payment: {:?}", e);
+				match e {
+					RetryableSendFailure::DuplicatePayment => Error::DuplicatePayment,
+					_ => Error::PaymentSendingFailed,
+				}
+			})
+	}
+
+	fn retry_spontaneous_payment(
+		&self, payment_id: PaymentId, preimage: PaymentPreimage, node_id: PublicKey,
+		amount_msat: u64,
+	) -> Result<(), Error> {
+		let route_params = self.build_retry_route_params(node_id, amount_msat);
+		let recipient_fields = RecipientOnionFields::spontaneous_empty(amount_msat);
+
+		self.channel_manager
+			.send_spontaneous_payment(
+				Some(preimage),
+				recipient_fields,
+				payment_id,
+				route_params,
+				Retry::Timeout(LDK_PAYMENT_RETRY_TIMEOUT),
+			)
+			.map(|_hash| ())
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to dispatch retry spontaneous payment: {:?}", e);
+				match e {
+					RetryableSendFailure::DuplicatePayment => Error::DuplicatePayment,
+					_ => Error::PaymentSendingFailed,
+				}
+			})
 	}
 }
 

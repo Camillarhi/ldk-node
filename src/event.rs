@@ -860,6 +860,7 @@ where
 							offer_id,
 							payer_note,
 							quantity,
+							counterparty_node_id: None,
 						};
 
 						let payment = PaymentDetails::new(
@@ -901,6 +902,7 @@ where
 						let kind = PaymentKind::Spontaneous {
 							hash: payment_hash,
 							preimage: Some(preimage),
+							counterparty_node_id: None,
 						};
 
 						let payment = PaymentDetails::new(

@@ -7,6 +7,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Txid};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::DecodeError;
@@ -139,10 +140,10 @@ impl Readable for PaymentDetails {
 						lsp_fee_limits,
 					}
 				} else {
-					PaymentKind::Bolt11 { hash, preimage, secret }
+					PaymentKind::Bolt11 { hash, preimage, secret, counterparty_node_id: None }
 				}
 			} else {
-				PaymentKind::Spontaneous { hash, preimage }
+				PaymentKind::Spontaneous { hash, preimage, counterparty_node_id: None }
 			}
 		};
 
@@ -375,6 +376,8 @@ pub enum PaymentKind {
 		preimage: Option<PaymentPreimage>,
 		/// The secret used by the payment.
 		secret: Option<PaymentSecret>,
+		/// The counterparty node we paid.
+		counterparty_node_id: Option<PublicKey>,
 	},
 	/// A [BOLT 11] payment intended to open an [bLIP-52 / LSPS 2] just-in-time channel.
 	///
@@ -428,6 +431,8 @@ pub enum PaymentKind {
 		///
 		/// This will always be `None` for payments serialized with version `v0.3.0`.
 		quantity: Option<u64>,
+		/// The counterparty node we paid.
+		counterparty_node_id: Option<PublicKey>,
 	},
 	/// A [BOLT 12] 'refund' payment, i.e., a payment for a [`Refund`].
 	///
@@ -455,6 +460,8 @@ pub enum PaymentKind {
 		hash: PaymentHash,
 		/// The pre-image used by the payment.
 		preimage: Option<PaymentPreimage>,
+		/// The counterparty node we paid.
+		counterparty_node_id: Option<PublicKey>,
 	},
 }
 
@@ -467,6 +474,7 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(0, hash, required),
 		(2, preimage, option),
 		(4, secret, option),
+		(5, counterparty_node_id, option),
 	},
 	(4, Bolt11Jit) => {
 		(0, hash, required),
@@ -482,10 +490,12 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(3, quantity, option),
 		(4, secret, option),
 		(6, offer_id, required),
+		(7, counterparty_node_id, option),
 	},
 	(8, Spontaneous) => {
 		(0, hash, required),
 		(2, preimage, option),
+		(3, counterparty_node_id, option),
 	},
 	(10, Bolt12Refund) => {
 		(0, hash, option),
@@ -682,7 +692,7 @@ mod tests {
 			assert_eq!(bolt11_decoded, PaymentDetails::read(&mut &*bolt11_reencoded).unwrap());
 
 			match bolt11_decoded.kind {
-				PaymentKind::Bolt11 { hash: h, preimage: p, secret: s } => {
+				PaymentKind::Bolt11 { hash: h, preimage: p, secret: s, .. } => {
 					assert_eq!(hash, h);
 					assert_eq!(preimage, p);
 					assert_eq!(secret, s);
@@ -769,7 +779,7 @@ mod tests {
 			);
 
 			match spontaneous_decoded.kind {
-				PaymentKind::Spontaneous { hash: h, preimage: p } => {
+				PaymentKind::Spontaneous { hash: h, preimage: p, .. } => {
 					assert_eq!(hash, h);
 					assert_eq!(preimage, p);
 				},

@@ -121,6 +121,7 @@ impl SpontaneousPayment {
 				let kind = PaymentKind::Spontaneous {
 					hash: payment_hash,
 					preimage: Some(payment_preimage),
+					counterparty_node_id: Some(node_id),
 				};
 				let payment = PaymentDetails::new(
 					payment_id,
@@ -143,6 +144,7 @@ impl SpontaneousPayment {
 						let kind = PaymentKind::Spontaneous {
 							hash: payment_hash,
 							preimage: Some(payment_preimage),
+							counterparty_node_id: Some(node_id),
 						};
 						let payment = PaymentDetails::new(
 							payment_id,

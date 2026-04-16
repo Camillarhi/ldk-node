@@ -154,6 +154,7 @@ impl Bolt12Payment {
 					offer_id: offer.id(),
 					payer_note: payer_note.map(UntrustedString),
 					quantity,
+					counterparty_node_id: payee_pubkey,
 				};
 				let payment = PaymentDetails::new(
 					payment_id,
@@ -179,6 +180,7 @@ impl Bolt12Payment {
 							offer_id: offer.id(),
 							payer_note: payer_note.map(UntrustedString),
 							quantity,
+							counterparty_node_id: offer.issuer_signing_pubkey(),
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
@@ -316,6 +318,7 @@ impl Bolt12Payment {
 					offer_id: offer.id(),
 					payer_note: payer_note.map(UntrustedString),
 					quantity,
+					counterparty_node_id: payee_pubkey,
 				};
 				let payment = PaymentDetails::new(
 					payment_id,
@@ -341,6 +344,7 @@ impl Bolt12Payment {
 							offer_id: offer.id(),
 							payer_note: payer_note.map(UntrustedString),
 							quantity,
+							counterparty_node_id: offer.issuer_signing_pubkey(),
 						};
 						let payment = PaymentDetails::new(
 							payment_id,

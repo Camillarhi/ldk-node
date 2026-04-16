@@ -132,6 +132,7 @@ impl Bolt11Payment {
 			hash: payment_hash,
 			preimage,
 			secret: Some(payment_secret.clone()),
+			counterparty_node_id: None,
 		};
 		let payment = PaymentDetails::new(
 			id,
@@ -283,6 +284,7 @@ impl Bolt11Payment {
 					hash: payment_hash,
 					preimage: None,
 					secret: payment_secret,
+					counterparty_node_id: Some(payee_pubkey),
 				};
 				let payment = PaymentDetails::new(
 					payment_id,
@@ -312,6 +314,7 @@ impl Bolt11Payment {
 							hash: payment_hash,
 							preimage: None,
 							secret: payment_secret,
+							counterparty_node_id: Some(invoice.recover_payee_pub_key()),
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
@@ -397,6 +400,7 @@ impl Bolt11Payment {
 					hash: payment_hash,
 					preimage: None,
 					secret: payment_secret,
+					counterparty_node_id: Some(payee_pubkey),
 				};
 
 				let payment = PaymentDetails::new(
@@ -427,6 +431,7 @@ impl Bolt11Payment {
 							hash: payment_hash,
 							preimage: None,
 							secret: payment_secret,
+							counterparty_node_id: Some(invoice.recover_payee_pub_key()),
 						};
 						let payment = PaymentDetails::new(
 							payment_id,
