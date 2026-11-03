@@ -157,6 +157,8 @@ pub enum Error {
 	InvalidPayerProof,
 	/// Payjoin is not configured.
 	PayjoinNotConfigured,
+	/// The provided Payjoin URI is invalid or not a supported version.
+	PayjoinUriInvalid,
 	/// Payjoin session creation failed.
 	PayjoinSessionCreationFailed,
 	/// Payjoin session failed.
@@ -262,6 +264,9 @@ impl fmt::Display for Error {
 			},
 			Self::InvalidPayerProof => write!(f, "The provided payer proof is invalid."),
 			Self::PayjoinNotConfigured => write!(f, "Payjoin is not configured."),
+			Self::PayjoinUriInvalid => {
+				write!(f, "The provided Payjoin URI is invalid or not a supported version.")
+			},
 			Self::PayjoinSessionCreationFailed => write!(f, "Payjoin session creation failed."),
 			Self::PayjoinSessionFailed => write!(f, "Payjoin session failed."),
 		}

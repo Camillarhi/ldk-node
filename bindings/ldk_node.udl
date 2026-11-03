@@ -221,6 +221,7 @@ enum NodeError {
 	"ChainSourceNotSupported",
 	"InvalidPayerProof",
 	"PayjoinNotConfigured",
+	"PayjoinUriInvalid",
 	"PayjoinSessionCreationFailed",
 	"PayjoinSessionFailed",
 };

@@ -7222,3 +7222,90 @@ async fn open_channel_with_fee_rate_override() {
 	node_c.stop().unwrap();
 	node_d.stop().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payjoin_send_receive() {
+	use ldk_node::config::PayjoinConfig;
+
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = TestChainSource::BitcoindRpcSync(&bitcoind);
+
+	let payjoin_config = PayjoinConfig {
+		payjoin_directory: "https://payjo.in".to_string(),
+		ohttp_relays: vec![
+			"https://pj.benalleng.com".to_string(),
+			"https://pj.bobspacebkk.com".to_string(),
+			"https://payjoin.achow101.com".to_string(),
+		],
+	};
+
+	let mut config_receiver = random_config();
+	config_receiver.node_config.payjoin_config = Some(payjoin_config.clone());
+	setup_builder!(builder_receiver, config_receiver.node_config);
+	configure_chain_source(&chain_source, &mut builder_receiver, &config_receiver);
+	let receiver = builder_receiver.build(config_receiver.node_entropy.into()).unwrap();
+	receiver.start().unwrap();
+
+	let mut config_sender = random_config();
+	config_sender.node_config.payjoin_config = Some(payjoin_config);
+	setup_builder!(builder_sender, config_sender.node_config);
+	configure_chain_source(&chain_source, &mut builder_sender, &config_sender);
+	let sender = builder_sender.build(config_sender.node_entropy.into()).unwrap();
+	sender.start().unwrap();
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![
+			receiver.onchain_payment().new_address().unwrap(),
+			sender.onchain_payment().new_address().unwrap(),
+		],
+		Amount::from_sat(500_000),
+	)
+	.await;
+
+	receiver.sync_wallets().unwrap();
+	sender.sync_wallets().unwrap();
+
+	let recv_session = receiver.payjoin_payment().receive(50_000, None).await.unwrap();
+	sender.payjoin_payment().send(recv_session.uri.clone(), None).await.unwrap();
+
+	let poll = async {
+		loop {
+			generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+			receiver.sync_wallets().unwrap();
+			sender.sync_wallets().unwrap();
+
+			let recv_done = receiver.list_payments_matching(|p| {
+				matches!(
+					p.kind,
+					PaymentKind::Onchain { tx_type: Some(TransactionType::Payjoin), .. }
+				)
+			});
+			let send_done = sender.list_payments_matching(|p| {
+				matches!(
+					p.kind,
+					PaymentKind::Onchain { tx_type: Some(TransactionType::Payjoin), .. }
+				)
+			});
+
+			if !recv_done.is_empty() && !send_done.is_empty() {
+				return (
+					recv_done.into_iter().next().unwrap(),
+					send_done.into_iter().next().unwrap(),
+				);
+			}
+
+			tokio::time::sleep(Duration::from_secs(5)).await;
+		}
+	};
+
+	let (recv_payment, send_payment) =
+		tokio::time::timeout(Duration::from_secs(300), poll).await.expect("payjoin timed out");
+
+	assert!(recv_payment.amount_msat.unwrap_or(0) >= 50_000 * 1_000);
+	assert!(send_payment.amount_msat.unwrap_or(0) >= 50_000 * 1_000);
+
+	receiver.stop().unwrap();
+	sender.stop().unwrap();
+}

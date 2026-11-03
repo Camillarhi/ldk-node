@@ -14,6 +14,8 @@ pub(crate) mod seen_inputs;
 
 use std::sync::{Arc, RwLock};
 
+use lightning::ln::channelmanager::PaymentId;
+
 use crate::{
 	error::Error,
 	payment::payjoin::manager::{PayjoinManager, PayjoinReceiveSession},
@@ -82,5 +84,29 @@ impl PayjoinPayment {
 
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
 		manager.receive_payjoin(amount_sats, fee_rate_opt).await
+	}
+
+	/// Initiates a Payjoin send session from a BIP 21 URI.
+	///
+	/// Builds and signs an original PSBT paying the URI's address and amount, then queues a
+	/// background session that POSTs it to the receiver's Payjoin directory and polls for the
+	/// receiver's proposal. On success the payjoin transaction is signed and broadcast
+	/// automatically. If the session expires or is aborted the original transaction is broadcast
+	/// as a fallback.
+	///
+	/// Returns [`Error::PayjoinNotConfigured`] if no [`PayjoinConfig`] was set.
+	/// Returns [`Error::PayjoinUriInvalid`] if the URI cannot be parsed or is not BIP 77 v2.
+	/// Returns [`Error::InvalidAmount`] if the URI carries no amount.
+	///
+	/// [`PayjoinConfig`]: crate::config::PayjoinConfig
+	pub async fn send(&self, bip21: String, fee_rate: Option<FeeRate>) -> Result<PaymentId, Error> {
+		let manager = self.manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
+
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
+		manager.send_payjoin(&bip21, fee_rate_opt).await
 	}
 }

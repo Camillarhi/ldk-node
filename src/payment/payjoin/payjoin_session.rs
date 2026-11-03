@@ -81,10 +81,13 @@ impl_writeable_tlv_based!(PayjoinSession, {
 pub enum PayjoinSessionKind {
 	/// We are receiving a payjoin.
 	Receive,
+	/// We are sending a payjoin.
+	Send,
 }
 
 impl_writeable_tlv_based_enum!(PayjoinSessionKind,
-	(0, Receive) => {}
+	(0, Receive) => {},
+	(2, Send) => {},
 );
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -218,6 +221,21 @@ mod tests {
 				script_pubkey: ScriptBuf::new(),
 			}],
 		}
+	}
+
+	#[test]
+	fn send_session_round_trips() {
+		let mut session = PayjoinSession::new(PaymentId([8; 32]), PayjoinSessionKind::Send);
+		assert_eq!(session.fallback_tx(), None);
+
+		session.set_fallback_tx(dummy_tx());
+		session.events.push(SerializedSessionEvent { event_bytes: vec![4, 5, 6], created_at: 99 });
+		session.status = PayjoinStatus::Completed;
+		session.completed_at = Some(100);
+
+		let decoded = PayjoinSession::read(&mut &session.encode()[..]).unwrap();
+		assert_eq!(decoded, session);
+		assert_eq!(decoded.fallback_tx(), Some(&dummy_tx()));
 	}
 
 	#[test]

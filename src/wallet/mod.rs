@@ -3098,15 +3098,16 @@ impl Wallet {
 		Ok(())
 	}
 
-	/// Tags an incoming payjoin transaction as [`TransactionType::Payjoin`].
+	/// Tags a payjoin transaction as [`TransactionType::Payjoin`].
 	///
-	/// The sender broadcasts a payjoin, so we only learn the outcome once monitoring finds the
-	/// transaction, possibly after wallet sync has already recorded or even graduated it. Like a
-	/// late funding classification, this merges only the classification into an existing record
-	/// and leaves its figures, status and confirmation state to wallet sync. If no record exists
-	/// yet, one is created from `tx` and marked as pending.
+	/// When `fee_paid_sats` is `Some` (sender), authoritative figures are stored in the facts
+	/// store so wallet sync uses them via [`TxProvenance::local_figures`] rather than recomputing
+	/// with BDK, which cannot determine fee for a payjoin (it only knows one party's inputs).
+	/// When `fee_paid_sats` is `None` (receiver), only the classification is merged; figures and
+	/// confirmation state are left to wallet sync. If no record exists yet, one is created from
+	/// `tx` and marked as pending.
 	pub(crate) async fn classify_payjoin(
-		&self, txid: Txid, tx: Option<&Transaction>,
+		&self, txid: Txid, tx: Option<&Transaction>, fee_paid_sats: Option<u64>,
 	) -> Result<(), Error> {
 		// Held across both stores, as wallet sync and the other classifiers do, so neither sees
 		// the record and its pending index out of step.
@@ -3114,10 +3115,52 @@ impl Wallet {
 
 		let id = PaymentId(txid.to_byte_array());
 		let (amount_msat, fee_paid_msat, direction) = match tx {
-			Some(tx) => self.onchain_payment_fields(tx),
+			Some(tx) => {
+				if let Some(fee_sat) = fee_paid_sats {
+					let locked_wallet = self.inner.lock().expect("lock");
+					let (sent, received) = locked_wallet.sent_and_received(tx);
+					let (direction, amount_msat) = if sent > received {
+						(
+							PaymentDirection::Outbound,
+							Some(
+								sent.to_sat()
+									.saturating_sub(fee_sat)
+									.saturating_sub(received.to_sat())
+									* 1_000,
+							),
+						)
+					} else {
+						(
+							PaymentDirection::Inbound,
+							Some(received.to_sat().saturating_sub(sent.to_sat()) * 1_000),
+						)
+					};
+					(amount_msat, Some(fee_sat * 1_000), direction)
+				} else {
+					self.onchain_payment_fields(tx)
+				}
+			},
 			// Wallet sync fills the values in on its next event for this txid.
 			None => (None, None, PaymentDirection::Inbound),
 		};
+
+		// When we have authoritative figures (from the PSBT), store them in the channel tx
+		// facts store so that wallet sync's `create_payment_from_tx` picks them up via
+		// `provenance.local_figures()` rather than recomputing with its partial wallet view.
+		if fee_paid_sats.is_some() {
+			let figures = LocalFundingFigures {
+				funding_payment_id: id,
+				amount_msat,
+				fee_paid_msat,
+				direction,
+			};
+			self.record_channel_tx_facts(
+				ChannelTxFacts::new(txid)
+					.with_self_role(TransactionType::Payjoin)
+					.with_local_figures(figures),
+			)
+			.await?;
+		}
 		let details = PaymentDetails::new(
 			id,
 			PaymentKind::Onchain {
@@ -3769,6 +3812,53 @@ impl Wallet {
 	}
 
 	#[allow(deprecated)]
+	pub(crate) async fn build_payjoin_sender_psbt(
+		&self, address: &bitcoin::Address, amount: Amount, fee_rate: FeeRate,
+	) -> Result<Psbt, Error> {
+		self.parse_and_validate_address(address)?;
+
+		let mut locked_persister = self.persister.lock().await;
+		let (psbt, change_set) = {
+			let mut locked_wallet = self.inner.lock().expect("lock");
+
+			let mut tx_builder = locked_wallet.build_tx();
+			tx_builder.add_recipient(address.script_pubkey(), amount).fee_rate(fee_rate);
+
+			let mut psbt = match tx_builder.finish() {
+				Ok(psbt) => {
+					log_debug!(self.logger, "Created payjoin sender PSBT: {:?}", psbt);
+					psbt
+				},
+				Err(err) => {
+					log_error!(self.logger, "Failed to create payjoin sender PSBT: {}", err);
+					return Err(err.into());
+				},
+			};
+
+			match locked_wallet.sign(&mut psbt, SignOptions::default()) {
+				Ok(finalized) => {
+					if !finalized {
+						log_error!(self.logger, "Failed to finalize payjoin sender PSBT.");
+						return Err(Error::OnchainTxCreationFailed);
+					}
+				},
+				Err(err) => {
+					log_error!(self.logger, "Failed to sign payjoin sender PSBT: {}", err);
+					return Err(err.into());
+				},
+			}
+
+			(psbt, locked_wallet.take_staged().unwrap_or_default())
+		};
+
+		locked_persister.persist_changeset(change_set).await.map_err(|e| {
+			log_error!(self.logger, "Failed to persist wallet changeset: {}", e);
+			Error::PersistenceFailed
+		})?;
+
+		Ok(psbt)
+	}
+
 	pub(crate) fn process_psbt(&self, mut psbt: Psbt) -> Result<Psbt, Error> {
 		let locked_wallet = self.inner.lock().expect("lock");
 
