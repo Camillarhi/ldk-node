@@ -17,14 +17,18 @@ use lightning::log_warn;
 use payjoin::io::fetch_ohttp_keys;
 use payjoin::persist::OptionalTransitionOutcome;
 use payjoin::receive::v2::{
-	replay_event_log_async as replay_receiver_event_log_async, CreateRequestError,
-	HasReplyableError, Initialized, MaybeInputsOwned, MaybeInputsSeen, Monitor, OutputsUnknown,
-	PayjoinProposal, ProvisionalProposal, ReceiveSession, Receiver, ReceiverBuilder,
+	replay_event_log_async as replay_receiver_event_log_async, HasReplyableError, Initialized,
+	MaybeInputsOwned, MaybeInputsSeen, Monitor, OutputsUnknown, PayjoinProposal,
+	ProvisionalProposal, ReceiveSession, Receiver, ReceiverBuilder,
 	SessionOutcome as ReceiverSessionOutcome, UncheckedOriginalPayload, WantsFeeRange, WantsInputs,
 	WantsOutputs,
 };
 use payjoin::receive::InputPair;
-use payjoin::ImplementationError;
+use payjoin::send::v2::{
+	replay_event_log_async as replay_sender_event_log_async, PollingForProposal, SendSession,
+	Sender, SenderBuilder, SessionOutcome as SenderSessionOutcome, WithReplyKey,
+};
+use payjoin::{ImplementationError, PjParam, Uri};
 
 use crate::chain::ChainSource;
 use crate::config::{
@@ -34,7 +38,9 @@ use crate::config::{
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 use crate::payment::payjoin::payjoin_session::{PayjoinSession, PayjoinSessionKind, PayjoinStatus};
-use crate::payment::payjoin::persist::KVStorePayjoinReceiverPersister;
+use crate::payment::payjoin::persist::{
+	KVStorePayjoinReceiverPersister, KVStorePayjoinSenderPersister,
+};
 use crate::payment::payjoin::seen_inputs::check_and_record_seen_input;
 
 use crate::types::{Broadcaster, PayjoinSeenInputsStore, PayjoinSessionStore};
@@ -136,6 +142,7 @@ impl PayjoinManager {
 		let persister = KVStorePayjoinReceiverPersister::new(
 			session_id,
 			Arc::clone(&self.payjoin_session_store),
+			PayjoinSessionKind::Receive,
 		);
 
 		let session =
@@ -158,6 +165,89 @@ impl PayjoinManager {
 		let pj_uri = session.pj_uri();
 
 		Ok(PayjoinReceiveSession { uri: pj_uri.to_string(), session_id })
+	}
+
+	pub(crate) async fn send_payjoin(
+		&self, bip21: &str, fee_rate: Option<FeeRate>,
+	) -> Result<PaymentId, Error> {
+		let payjoin_config =
+			self.config.payjoin_config.as_ref().ok_or(Error::PayjoinNotConfigured)?;
+
+		if payjoin_config.ohttp_relays.is_empty() {
+			log_error!(self.logger, "No OHTTP relays configured.");
+			return Err(Error::PayjoinNotConfigured);
+		}
+
+		let uri = Uri::try_from(bip21)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to parse payjoin URI: {}", e);
+				Error::PayjoinUriInvalid
+			})?
+			.assume_checked()
+			.check_pj_supported()
+			.map_err(|_| {
+				log_error!(self.logger, "URI does not support Payjoin.");
+				Error::PayjoinUriInvalid
+			})?;
+
+		let pj_param = match uri.extras().pj_param() {
+			PjParam::V2(p) => p,
+			#[allow(unreachable_patterns)]
+			_ => {
+				log_error!(self.logger, "Only BIP 77 (v2) Payjoin URIs are supported.");
+				return Err(Error::PayjoinUriInvalid);
+			},
+		};
+
+		let address = uri.address().clone();
+		let amount = uri.amount().ok_or_else(|| {
+			log_error!(self.logger, "Payjoin URI is missing an amount.");
+			Error::InvalidAmount
+		})?;
+
+		let mut random_bytes = [0u8; 32];
+		getrandom::fill(&mut random_bytes).map_err(|e| {
+			log_error!(self.logger, "Failed to generate random session ID: {}", e);
+			Error::PayjoinSessionCreationFailed
+		})?;
+		let session_id = PaymentId(random_bytes);
+
+		let confirmation_target = ConfirmationTarget::OnchainPayment;
+		let fee_rate =
+			fee_rate.unwrap_or_else(|| self.fee_estimator.estimate_fee_rate(confirmation_target));
+
+		let original_psbt =
+			self.wallet.build_payjoin_sender_psbt(&address, amount, fee_rate).await?;
+
+		let fallback_tx = original_psbt.clone().extract_tx_unchecked_fee_rate();
+
+		// Persist the fallback tx before saving the first session event so it survives a crash
+		// between PSBT creation and the first relay POST.
+		let mut session = PayjoinSession::new(session_id, PayjoinSessionKind::Send);
+		session.set_fallback_tx(fallback_tx);
+		self.payjoin_session_store.insert_or_update(session).await?;
+
+		let persister = KVStorePayjoinSenderPersister::from_session(
+			session_id,
+			Arc::clone(&self.payjoin_session_store),
+		)
+		.await?;
+
+		SenderBuilder::from_parts(original_psbt, pj_param, &address, Some(amount))
+			.build_recommended(fee_rate)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to build payjoin sender: {}", e);
+				Error::PayjoinSessionCreationFailed
+			})?
+			.save_async(&persister)
+			.await
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to persist the new payjoin send session: {:?}", e);
+				Error::PersistenceFailed
+			})?;
+
+		log_info!(self.logger, "Payjoin send session established.");
+		Ok(session_id)
 	}
 
 	fn relay_order<'a>(&self, payjoin_config: &'a PayjoinConfig) -> Result<Vec<&'a str>, Error> {
@@ -243,11 +333,61 @@ impl PayjoinManager {
 		}
 	}
 
+	async fn process_sender_session(
+		&self, mut session: SendSession, persister: &KVStorePayjoinSenderPersister,
+	) -> Result<(), Error> {
+		loop {
+			session = match session {
+				SendSession::WithReplyKey(sender) => {
+					self.post_original_psbt(sender, persister).await?
+				},
+				SendSession::PollingForProposal(sender) => {
+					match self.poll_for_proposal(sender, persister).await? {
+						// No proposal yet; yield so the next background tick retries.
+						SendSession::PollingForProposal(_) => return Ok(()),
+						next => next,
+					}
+				},
+				SendSession::Closed(SenderSessionOutcome::Success(proposal_psbt)) => {
+					self.finalize_and_broadcast(proposal_psbt, persister).await?;
+					return Ok(());
+				},
+				SendSession::Closed(SenderSessionOutcome::Aborted) => {
+					self.broadcast_sender_fallback(persister).await;
+					return Ok(());
+				},
+				SendSession::PendingFallback(pending) => {
+					let fallback_tx = pending.fallback_tx().clone();
+					let mut session = persister.get_session().await?;
+					self.close_session_with_fallback(&mut session, Some(&fallback_tx)).await;
+					pending.close().save_async(persister).await.map_err(|e| {
+						log_error!(
+							self.logger,
+							"Failed to close pending fallback session: {:?}",
+							e
+						);
+						Error::PersistenceFailed
+					})?;
+					return Ok(());
+				},
+			};
+		}
+	}
+
 	async fn read_from_directory(
 		&self, session: Receiver<Initialized>, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<ReceiveSession, Error> {
-		let Some((ohttp_response, context)) =
-			self.post_via_relay(|relay| session.create_poll_request(relay)).await?
+		let Some((ohttp_response, context)) = self
+			.post_via_relay(|relay| {
+				session.create_poll_request(relay).map(Some).or_else(|e| {
+					if e.is_expired() {
+						Ok(None)
+					} else {
+						Err(Error::PayjoinSessionFailed)
+					}
+				})
+			})
+			.await?
 		else {
 			log_info!(self.logger, "Payjoin session {} expired.", persister.session_id());
 			return Ok(ReceiveSession::Closed(ReceiverSessionOutcome::Aborted));
@@ -545,8 +685,17 @@ impl PayjoinManager {
 	async fn send_payjoin_proposal(
 		&self, proposal: Receiver<PayjoinProposal>, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<ReceiveSession, Error> {
-		let Some((ohttp_response, context)) =
-			self.post_via_relay(|relay| proposal.create_post_request(relay)).await?
+		let Some((ohttp_response, context)) = self
+			.post_via_relay(|relay| {
+				proposal.create_post_request(relay).map(Some).or_else(|e| {
+					if e.is_expired() {
+						Ok(None)
+					} else {
+						Err(Error::PayjoinSessionFailed)
+					}
+				})
+			})
+			.await?
 		else {
 			log_info!(self.logger, "Payjoin session {} expired.", persister.session_id());
 			return Ok(ReceiveSession::Closed(ReceiverSessionOutcome::Aborted));
@@ -669,25 +818,149 @@ impl PayjoinManager {
 		}
 	}
 
+	async fn post_original_psbt(
+		&self, sender: Sender<WithReplyKey>, persister: &KVStorePayjoinSenderPersister,
+	) -> Result<SendSession, Error> {
+		let Some((response, ctx)) = self
+			.post_via_relay(|relay| {
+				sender.create_v2_post_request(relay).map(Some).or_else(|e| {
+					if e.is_expired() {
+						Ok(None)
+					} else {
+						Err(Error::PayjoinSessionFailed)
+					}
+				})
+			})
+			.await?
+		else {
+			log_info!(self.logger, "Payjoin send session {} expired.", persister.session_id());
+			return Ok(SendSession::Closed(SenderSessionOutcome::Aborted));
+		};
+
+		match sender.process_response(response.as_bytes(), ctx).save_async(persister).await {
+			Ok(next) => {
+				log_info!(self.logger, "Posted original PSBT. Waiting for payjoin proposal.");
+				Ok(SendSession::PollingForProposal(next))
+			},
+			Err(e) if e.is_transient() => {
+				log_debug!(self.logger, "Transient error posting original PSBT, retrying: {:?}", e);
+				let sender = e.transient_state().expect("transient error carries current state");
+				Ok(SendSession::WithReplyKey(sender))
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to process response to original PSBT post: {:?}",
+					e
+				);
+				Err(Error::PayjoinSessionFailed)
+			},
+		}
+	}
+
+	async fn poll_for_proposal(
+		&self, sender: Sender<PollingForProposal>, persister: &KVStorePayjoinSenderPersister,
+	) -> Result<SendSession, Error> {
+		let Some((response, ctx)) = self
+			.post_via_relay(|relay| {
+				sender.create_poll_request(relay).map(Some).or_else(|e| {
+					if e.is_expired() {
+						Ok(None)
+					} else {
+						Err(Error::PayjoinSessionFailed)
+					}
+				})
+			})
+			.await?
+		else {
+			log_info!(self.logger, "Payjoin send session {} expired.", persister.session_id());
+			return Ok(SendSession::Closed(SenderSessionOutcome::Aborted));
+		};
+
+		match sender.clone().process_response(response.as_bytes(), ctx).save_async(persister).await
+		{
+			Ok(OptionalTransitionOutcome::Progress(proposal_psbt)) => {
+				log_info!(self.logger, "Received payjoin proposal from receiver. Processing.");
+				Ok(SendSession::Closed(SenderSessionOutcome::Success(proposal_psbt)))
+			},
+			Ok(OptionalTransitionOutcome::Stasis(current)) => {
+				log_debug!(self.logger, "No payjoin proposal yet.");
+				Ok(SendSession::PollingForProposal(current))
+			},
+			Err(e) if e.is_transient() => {
+				log_debug!(self.logger, "Transient error polling for proposal, retrying: {:?}", e);
+				let sender = e.transient_state().expect("transient error carries current state");
+				Ok(SendSession::PollingForProposal(sender))
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to process payjoin proposal poll response: {:?}",
+					e
+				);
+				Err(Error::PayjoinSessionFailed)
+			},
+		}
+	}
+
+	async fn finalize_and_broadcast(
+		&self, proposal_psbt: bitcoin::Psbt, persister: &KVStorePayjoinSenderPersister,
+	) -> Result<(), Error> {
+		let signed_psbt = self.wallet.process_psbt(proposal_psbt).map_err(|e| {
+			log_error!(self.logger, "Failed to sign payjoin proposal PSBT: {:?}", e);
+			e
+		})?;
+
+		let fee_paid_sats = signed_psbt.fee().ok().map(|f| f.to_sat());
+		let tx = signed_psbt.extract_tx_unchecked_fee_rate();
+		let txid = tx.compute_txid();
+		self.broadcaster.broadcast(tx.clone());
+
+		log_info!(self.logger, "Payjoin transaction broadcast. TXID: {}", txid);
+
+		self.wallet.classify_payjoin(txid, Some(&tx), fee_paid_sats).await?;
+
+		let mut session = persister.get_session().await?;
+		session.status = PayjoinStatus::Completed;
+		session.completed_at = Some(
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.unwrap_or(Duration::from_secs(0))
+				.as_secs(),
+		);
+		self.payjoin_session_store.insert_or_update(session).await?;
+
+		Ok(())
+	}
+
+	async fn broadcast_sender_fallback(&self, persister: &KVStorePayjoinSenderPersister) {
+		match persister.get_session().await {
+			Ok(mut session) => self.close_session_with_fallback(&mut session, None).await,
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to load session {} to broadcast fallback: {:?}",
+					persister.session_id(),
+					e
+				);
+			},
+		}
+	}
+
 	async fn post_via_relay<F>(
 		&self, mut build: F,
 	) -> Result<Option<(bitreq::Response, payjoin::OhttpResponse)>, Error>
 	where
-		F: FnMut(&str) -> Result<(payjoin::Request, payjoin::OhttpResponse), CreateRequestError>,
+		F: FnMut(&str) -> Result<Option<(payjoin::Request, payjoin::OhttpResponse)>, Error>,
 	{
 		let payjoin_config =
 			self.config.payjoin_config.as_ref().ok_or(Error::PayjoinNotConfigured)?;
 
 		for relay in self.relay_order(payjoin_config)? {
-			let (req, ctx) = match build(relay) {
-				Ok(r) => r,
-				Err(e) if e.is_expired() => return Ok(None),
-				Err(e) => {
-					// Building the request doesn't depend on the relay, so this would fail
-					// the same way for every remaining relay.
-					log_error!(self.logger, "Failed to build payjoin request: {}", e);
-					return Err(Error::PayjoinSessionFailed);
-				},
+			let (req, ctx) = match build(relay)? {
+				Some(r) => r,
+				// Session expired; caller handles this as a clean abort.
+				None => return Ok(None),
 			};
 
 			match self.post_request(req).await {
@@ -710,8 +983,17 @@ impl PayjoinManager {
 	async fn handle_error(
 		&self, session: Receiver<HasReplyableError>, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<ReceiveSession, Error> {
-		let Some((err_response, err_ctx)) =
-			self.post_via_relay(|relay| session.create_error_request(relay)).await?
+		let Some((err_response, err_ctx)) = self
+			.post_via_relay(|relay| {
+				session.create_error_request(relay).map(Some).or_else(|e| {
+					if e.is_expired() {
+						Ok(None)
+					} else {
+						Err(Error::PayjoinSessionFailed)
+					}
+				})
+			})
+			.await?
 		else {
 			log_info!(self.logger, "Payjoin session {} expired.", persister.session_id());
 			return Ok(ReceiveSession::Closed(ReceiverSessionOutcome::Aborted));
@@ -776,7 +1058,7 @@ impl PayjoinManager {
 						None
 					},
 				};
-				self.wallet.classify_payjoin(txid, tx.as_ref()).await?;
+				self.wallet.classify_payjoin(txid, tx.as_ref(), None).await?;
 
 				session.status = PayjoinStatus::Completed;
 
@@ -825,24 +1107,111 @@ impl PayjoinManager {
 			retry_at.iter().filter(|(_, at)| now < **at).map(|(id, _)| *id).collect()
 		};
 
-		let recv_session_ids = self
+		let active_sessions = self
 			.payjoin_session_store
 			.list_filter(|p| {
-				matches!(p.kind, PayjoinSessionKind::Receive)
-					&& p.status == PayjoinStatus::Active
-					&& !backing_off.contains(&p.session_id)
+				p.status == PayjoinStatus::Active && !backing_off.contains(&p.session_id)
 			})
-			.await
-			.into_iter()
-			.map(|s| s.session_id)
-			.collect::<Vec<PaymentId>>();
+			.await;
 
-		if recv_session_ids.is_empty() {
+		let recv_session_ids: Vec<PaymentId> = active_sessions
+			.iter()
+			.filter(|p| matches!(p.kind, PayjoinSessionKind::Receive))
+			.map(|s| s.session_id)
+			.collect();
+
+		let send_session_ids: Vec<PaymentId> = active_sessions
+			.iter()
+			.filter(|p| matches!(p.kind, PayjoinSessionKind::Send))
+			.map(|s| s.session_id)
+			.collect();
+
+		if recv_session_ids.is_empty() && send_session_ids.is_empty() {
 			log_debug!(self.logger, "No sessions to resume.");
 			return Ok(());
 		}
 
 		let mut join_set: tokio::task::JoinSet<Result<(), Error>> = tokio::task::JoinSet::new();
+
+		// Process sender sessions
+		for session_id in send_session_ids {
+			let self_clone = self.clone();
+			let send_persister = match KVStorePayjoinSenderPersister::from_session(
+				session_id,
+				Arc::clone(&self.payjoin_session_store),
+			)
+			.await
+			{
+				Ok(p) => p,
+				Err(e) => {
+					log_error!(
+						self.logger,
+						"Failed to create persister for sender session {:?}: {:?}",
+						session_id,
+						e
+					);
+					self.session_retry_at
+						.lock()
+						.expect("lock")
+						.insert(session_id, Instant::now() + PAYJOIN_RETRY_DELAY);
+					continue;
+				},
+			};
+
+			match replay_sender_event_log_async(&send_persister).await {
+				Ok((sender_state, _)) => {
+					join_set.spawn(async move {
+						let res =
+							self_clone.process_sender_session(sender_state, &send_persister).await;
+						{
+							let mut retry_at = self_clone.session_retry_at.lock().expect("lock");
+							if res.is_err() {
+								retry_at.insert(session_id, Instant::now() + PAYJOIN_RETRY_DELAY);
+							} else {
+								retry_at.remove(&session_id);
+							}
+						}
+						res
+					});
+				},
+				Err(e) if e.is_expired() => match send_persister.get_session().await {
+					Ok(mut session) => {
+						self.close_session_with_fallback(&mut session, e.expiry_fallback_tx()).await
+					},
+					Err(err) => log_error!(
+						self.logger,
+						"Failed to close expired sender session {session_id}: {err:?}"
+					),
+				},
+				Err(e) => {
+					log_error!(
+						self.logger,
+						"An error {:?} occurred while replaying sender session",
+						e
+					);
+					match self.payjoin_session_store.get(&session_id).await {
+						Ok(Some(mut session)) => {
+							self.close_session_with_fallback(&mut session, None).await;
+						},
+						Ok(None) => {
+							log_error!(
+								self.logger,
+								"Payjoin sender session {} disappeared before it could be closed.",
+								session_id
+							);
+						},
+						Err(e) => {
+							log_error!(
+								self.logger,
+								"Failed to read sender session {} while closing it: {:?}",
+								session_id,
+								e
+							);
+						},
+					}
+				},
+			}
+		}
 
 		// Process receiver sessions
 		for session_id in recv_session_ids {
@@ -975,7 +1344,7 @@ impl PayjoinManager {
 				close_err
 			);
 		} else {
-			log_info!(self.logger, "Closed failed receiver session: {}", session.session_id);
+			log_info!(self.logger, "Closed failed payjoin session: {}", session.session_id);
 		}
 	}
 
